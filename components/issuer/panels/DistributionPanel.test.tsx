@@ -213,58 +213,64 @@ describe("DistributionPanel unmount during in-flight async call", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    const allCalls = [...errorSpy.mock.calls, ...warnSpy.mock.calls]
-      .map((args) => args.map((a) => String(a)).join(" "))
-      .join("\n");
-
-    expect(allCalls).not.toMatch(/unmounted component/i);
-    expect(allCalls).not.toMatch(/Can't perform a React state update/i);
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 });
 
-describe("DistributionPanel cancel action", () => {
-  const adminAddress = "GADMIN0000000000000000000000000000000000000000000000000000";
-  const otherAddress = "GOTHER0000000000000000000000000000000000000000000000000000";
+describe("DistributionPanel reclaim unclaimed funds", () => {
+  const ADMIN = "GADMIN0000000000000000000000000000000000000000000000000000";
+  const OTHER = "GOTHER0000000000000000000000000000000000000000000000000000";
+
+  function makeDistribution(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 1,
+      issuer: ADMIN,
+      token: "CTOKENCONTRACT00000000000000000000000000000000000000000000",
+      total: 1000n,
+      claimed: 400n,
+      deadline: 0,
+      ...overrides,
+    };
+  }
 
   beforeEach(() => {
     vi.clearAllMocks();
+    walletState.address = ADMIN;
     walletState.network = "testnet";
-    distributionState.data = [
-      {
-        id: 1,
-        issuer: adminAddress,
-        token: "CTOKENCONTRACT00000000000000000000000000000000000000000000",
-        total: 1000n,
-        claimed: 0n,
-        deadline: 0,
-        status: "Active",
-      },
-    ];
   });
 
-  it("shows a cancel action to the admin and requires confirmation before cancelling", async () => {
-    walletState.address = adminAddress;
+  it("shows the reclaim action to the admin once the deadline has passed", () => {
+    distributionState.data = [makeDistribution({ deadline: 0 })];
     render(<DistributionPanel asset={makeAsset()} />);
 
-    const cancelButton = await screen.findByRole("button", { name: /cancel distribution/i });
-    expect(cancelButton).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /reclaim/i })).toBeInTheDocument();
+  });
 
-    // Clicking the action must not immediately fire the transaction; a
-    // confirmation step is required first.
-    fireEvent.click(cancelButton);
-    expect(txRun).not.toHaveBeenCalled();
-    expect(screen.getByText(/are you sure/i)).toBeInTheDocument();
+  it("hides the reclaim action before the deadline has passed", () => {
+    const future = Math.floor(Date.now() / 1000) + 60 * 60 * 24;
+    distributionState.data = [makeDistribution({ deadline: future })];
+    render(<DistributionPanel asset={makeAsset()} />);
 
-    // Confirming invokes the on-chain cancel_distribution via the tx hook.
-    fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+    expect(screen.queryByRole("button", { name: /reclaim/i })).not.toBeInTheDocument();
+  });
+
+  it("hides the reclaim action from wallets that are not the issuer", () => {
+    walletState.address = OTHER;
+    distributionState.data = [makeDistribution({ deadline: 0 })];
+    render(<DistributionPanel asset={makeAsset()} />);
+
+    expect(screen.queryByRole("button", { name: /reclaim/i })).not.toBeInTheDocument();
+  });
+
+  it("invokes reclaim_unclaimed when the admin clicks reclaim", async () => {
+    distributionState.data = [makeDistribution({ deadline: 0 })];
+    render(<DistributionPanel asset={makeAsset()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /reclaim/i }));
+
     await waitFor(() => expect(txRun).toHaveBeenCalled());
-  });
-
-  it("does not show the cancel action to non-admin wallets", async () => {
-    walletState.address = otherAddress;
-    render(<DistributionPanel asset={makeAsset()} />);
-
-    await screen.findByText(/Required role:/i);
-    expect(screen.queryByRole("button", { name: /cancel distribution/i })).not.toBeInTheDocument();
+    const call = txRun.mock.calls[0][0];
+    expect(call).toBeTruthy();
   });
 });

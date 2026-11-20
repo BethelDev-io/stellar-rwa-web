@@ -213,7 +213,7 @@ function CreateDistributionCard({
       const decimals = await assetToken.decimals(network, pt);
       raw = parseTokenAmount(totalAmount, decimals);
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : "Invalid total amount.");
+      setFormError(err instanceof Error ? err.message : "Invalid amount.");
       return;
     }
 
@@ -222,9 +222,9 @@ function CreateDistributionCard({
       return;
     }
 
-    const deadline = claimDeadline.trim() ? Number(claimDeadline) : 0;
-    if (!Number.isFinite(deadline) || deadline < 0) {
-      setFormError("Claim deadline must be a non-negative ledger number.");
+    const deadline = Math.floor(new Date(claimDeadline).getTime() / 1000);
+    if (!claimDeadline || Number.isNaN(deadline) || deadline <= Math.floor(Date.now() / 1000)) {
+      setFormError("Claim deadline must be in the future.");
       return;
     }
 
@@ -245,32 +245,24 @@ function CreateDistributionCard({
       return;
     }
 
-    const latestLedger = await getLatestLedger(network);
-    const resolvedDeadline = deadline > 0 ? deadline : latestLedger + 100;
-
-    await tx.run(
-      () =>
-        dividend.createDistribution(
-          network,
-          address!,
-          tokenContract,
-          pt,
-          raw,
-          resolvedDeadline,
-          holders.map(({ address: holderAddress, balance: holderBalance }) => ({
-            address: holderAddress,
-            amount: holderBalance,
-          })),
-        ),
-      {
-        onSuccess: () => {
-          setPaymentToken("");
-          setTotalAmount("");
-          setClaimDeadline("");
-          onCreated?.();
-        },
-      },
+    const ok = await tx.run(() =>
+      dividend.createDistribution(network, {
+        token: tokenContract,
+        paymentToken: pt,
+        totalAmount: raw,
+        claimDeadline: deadline,
+        holders: holders.map(({ address: holderAddress, balance: holderBalance }) => ({
+          address: holderAddress,
+          balance: holderBalance,
+        })),
+      }),
     );
+    if (ok) {
+      setPaymentToken("");
+      setTotalAmount("");
+      setClaimDeadline("");
+      onCreated?.();
+    }
   }
 
   async function refreshSnapshot() {
@@ -283,6 +275,8 @@ function CreateDistributionCard({
     }
   }
 
+  const knownTokens = KNOWN_TOKENS[network] ?? [];
+
   return (
     <ActionCard
       title="Create distribution"
@@ -290,31 +284,32 @@ function CreateDistributionCard({
     >
       <form onSubmit={onSubmit} className="space-y-4">
         <div>
-          <label htmlFor="dist-payment-token" className="block text-sm font-medium text-base-100/80">
+          <label htmlFor="dist-payment-token" className="mb-1 block text-sm font-medium text-base-100/80">
             Payment token
           </label>
           <input
             id="dist-payment-token"
-            type="text"
             value={paymentToken}
             onChange={(e) => setPaymentToken(e.target.value)}
             placeholder="C…"
             aria-invalid={tokenInvalid}
             aria-describedby={tokenInvalid ? "dist-form-error" : undefined}
-            className="mt-1 w-full rounded-lg border border-white/10 bg-base-900/60 px-3 py-2 text-sm text-base-100 placeholder:text-base-100/30 focus:border-primary focus:outline-none"
+            className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-base-100 placeholder:text-base-100/30 focus:border-brand-400 focus:outline-none"
           />
-          <div className="mt-2 flex flex-wrap gap-2">
-            {KNOWN_TOKENS[network].map((token) => (
-              <button
-                key={token.contractId}
-                type="button"
-                onClick={() => setPaymentToken(token.contractId)}
-                className="rounded-full border border-white/10 px-2.5 py-1 text-xs text-base-100/70 hover:border-primary hover:text-primary"
-              >
-                {token.label}
-              </button>
-            ))}
-          </div>
+          {knownTokens.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {knownTokens.map((token) => (
+                <button
+                  key={token.contractId}
+                  type="button"
+                  onClick={() => setPaymentToken(token.contractId)}
+                  className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-base-100/70 hover:border-brand-400 hover:text-base-100"
+                >
+                  {token.label}
+                </button>
+              ))}
+            </div>
+          )}
           {isValidPt && (
             <p className="mt-1 text-xs text-base-100/50">
               {balanceLoading || allowanceLoading ? (
@@ -334,78 +329,77 @@ function CreateDistributionCard({
         </div>
 
         <div>
-          <label htmlFor="dist-total" className="block text-sm font-medium text-base-100/80">
+          <label htmlFor="dist-total" className="mb-1 block text-sm font-medium text-base-100/80">
             Total amount ({assetSymbol})
           </label>
           <input
             id="dist-total"
-            type="text"
-            inputMode="decimal"
             value={totalAmount}
             onChange={(e) => setTotalAmount(e.target.value)}
             placeholder="0.00"
+            inputMode="decimal"
             aria-invalid={totalInvalid}
             aria-describedby={totalErrorIds}
-            className="mt-1 w-full rounded-lg border border-white/10 bg-base-900/60 px-3 py-2 text-sm text-base-100 placeholder:text-base-100/30 focus:border-primary focus:outline-none"
+            className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-base-100 placeholder:text-base-100/30 focus:border-brand-400 focus:outline-none"
           />
           {insufficientBalance && (
             <p id="dist-total-error" className="mt-1 text-xs text-red-400">
               Amount exceeds your payment-token balance.
             </p>
           )}
-          {needsApproval && (
-            <p className="mt-1 text-xs text-amber-400">
-              The dividend contract needs an allowance of at least this amount.
+          {needsApproval && !insufficientBalance && (
+            <p id="dist-total-error" className="mt-1 text-xs text-amber-400">
+              You must approve at least this amount before funding.
             </p>
           )}
         </div>
 
         <div>
-          <label htmlFor="dist-deadline" className="block text-sm font-medium text-base-100/80">
-            Claim deadline (ledger, optional)
+          <label htmlFor="dist-deadline" className="mb-1 block text-sm font-medium text-base-100/80">
+            Claim deadline
           </label>
           <input
             id="dist-deadline"
-            type="text"
-            inputMode="numeric"
+            type="datetime-local"
             value={claimDeadline}
             onChange={(e) => setClaimDeadline(e.target.value)}
-            placeholder="e.g. 1234567"
-            className="mt-1 w-full rounded-lg border border-white/10 bg-base-900/60 px-3 py-2 text-sm text-base-100 placeholder:text-base-100/30 focus:border-primary focus:outline-none"
+            className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-base-100 focus:border-brand-400 focus:outline-none"
           />
         </div>
 
-        <div className="rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2 text-xs text-base-100/60">
-          <div className="flex items-center justify-between">
-            <span>
-              Eligible holders: {holderSnapshot?.length ?? 0} · Total: {formatTokenAmount(snapshotTotal, assetDecimals)} {assetSymbol}
-            </span>
-            <button
-              type="button"
-              onClick={refreshSnapshot}
-              disabled={snapshotRefreshing}
-              className="text-primary hover:underline disabled:opacity-50"
-            >
-              {snapshotRefreshing ? "Refreshing…" : "Refresh"}
-            </button>
-          </div>
+        <div className="rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2 text-xs text-base-100/50">
+          {holderState.loading || snapshotRefreshing ? (
+            <Spinner size="sm" />
+          ) : (
+            <>
+              {holderSnapshot?.length ?? 0} eligible holders · total balance{" "}
+              {formatTokenAmount(snapshotTotal, assetDecimals)} {assetSymbol}
+            </>
+          )}
+          <button
+            type="button"
+            onClick={refreshSnapshot}
+            disabled={snapshotRefreshing}
+            className="ml-2 underline hover:text-base-100 disabled:opacity-50"
+          >
+            Refresh
+          </button>
         </div>
 
         {formError && (
-          <p id="dist-form-error" className="text-sm text-red-400">
+          <p id="dist-form-error" className="text-xs text-red-400">
             {formError}
           </p>
         )}
 
-        <TxProgress state={tx.state} />
-
         <button
           type="submit"
-          disabled={tx.state.status === "pending"}
-          className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary/90 disabled:opacity-50"
+          disabled={tx.status === "pending" || !isAdmin}
+          className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-400 disabled:opacity-50"
         >
-          {tx.state.status === "pending" ? "Creating…" : "Create distribution"}
+          {tx.status === "pending" ? "Creating…" : "Create distribution"}
         </button>
+        <TxProgress status={tx.status} error={tx.error} hash={tx.hash} />
       </form>
     </ActionCard>
   );
@@ -421,29 +415,16 @@ function ExistingDistributionsCard({
   isAdmin?: boolean;
 }) {
   const { address, network } = useWallet();
-  const { data, loading, error, refetch } = useDividends(tokenContract);
-  const [confirmingId, setConfirmingId] = useState<number | null>(null);
-  const cancelTx = useTx();
-
-  async function onCancel(distributionId: number) {
-    await cancelTx.run(
-      () =>
-        dividend.cancelDistribution(network, address!, tokenContract, distributionId),
-      {
-        onSuccess: () => {
-          setConfirmingId(null);
-          refetch();
-        },
-      },
-    );
-  }
+  const { data: distributions, loading, error, refetch } = useDividends(tokenContract);
+  const { data: latestLedger } = useAsync(
+    () => getLatestLedger(network),
+    [network],
+  );
 
   if (loading) {
     return (
       <ActionCard title="Distributions" description="Existing dividend distributions for this asset.">
-        <div className="flex justify-center py-6">
-          <Spinner />
-        </div>
+        <Spinner />
       </ActionCard>
     );
   }
@@ -456,69 +437,94 @@ function ExistingDistributionsCard({
     );
   }
 
-  const distributions = data ?? [];
+  if (!distributions || distributions.length === 0) {
+    return (
+      <ActionCard title="Distributions" description="Existing dividend distributions for this asset.">
+        <EmptyState title="No distributions yet" description="Create one above to get started." />
+      </ActionCard>
+    );
+  }
 
   return (
     <ActionCard title="Distributions" description="Existing dividend distributions for this asset.">
-      {distributions.length === 0 ? (
-        <EmptyState title="No distributions yet" description="Create one above to get started." />
-      ) : (
-        <ul className="divide-y divide-white/5">
-          {distributions.map((distribution) => {
-            const isConfirming = confirmingId === distribution.id;
-            const canCancel = isAdmin && !!address && distribution.status === "active";
-            return (
-              <li key={distribution.id} className="py-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-base-100">
-                      #{distribution.id} · {formatTokenAmount(distribution.totalAmount, distribution.decimals)} {distribution.symbol}
-                    </p>
-                    <p className="text-xs text-base-100/50">
-                      {distribution.status} · {percent(distribution.claimedPercent)} claimed
-                    </p>
-                  </div>
-                  {canCancel && !isConfirming && (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmingId(distribution.id)}
-                      className="rounded-lg border border-red-500/40 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/10"
-                    >
-                      Cancel
-                    </button>
-                  )}
-                </div>
-                {canCancel && isConfirming && (
-                  <div className="mt-2 rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2">
-                    <p className="text-xs text-base-100/70">
-                      Cancel distribution #{distribution.id}? Unclaimed funds will be returned to the issuer.
-                    </p>
-                    <div className="mt-2 flex gap-2">
-                      <button
-                        type="button"
-                        onClick={() => onCancel(distribution.id)}
-                        disabled={cancelTx.state.status === "pending"}
-                        className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500/90 disabled:opacity-50"
-                      >
-                        {cancelTx.state.status === "pending" ? "Cancelling…" : "Confirm cancel"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConfirmingId(null)}
-                        disabled={cancelTx.state.status === "pending"}
-                        className="rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-base-100/70 hover:bg-white/5 disabled:opacity-50"
-                      >
-                        Keep
-                      </button>
-                    </div>
-                    <TxProgress state={cancelTx.state} />
-                  </div>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      )}
+      <ul className="space-y-3">
+        {distributions.map((distribution) => (
+          <DistributionRow
+            key={distribution.id}
+            distribution={distribution}
+            latestLedger={latestLedger ?? null}
+            isAdmin={isAdmin}
+            walletAddress={address ?? null}
+            onChanged={refetch}
+          />
+        ))}
+      </ul>
     </ActionCard>
+  );
+}
+
+function DistributionRow({
+  distribution,
+  latestLedger,
+  isAdmin,
+  walletAddress,
+  onChanged,
+}: {
+  distribution: {
+    id: string;
+    totalAmount: bigint;
+    claimedAmount: bigint;
+    claimDeadline: number;
+    issuer?: string;
+  };
+  latestLedger: number | null;
+  isAdmin: boolean;
+  walletAddress: string | null;
+  onChanged: () => void;
+}) {
+  const tx = useTx();
+  const { network } = useWallet();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const deadlinePassed = distribution.claimDeadline > 0 && nowSeconds >= distribution.claimDeadline;
+  const unclaimed = distribution.totalAmount - distribution.claimedAmount;
+  const isIssuer =
+    !!walletAddress &&
+    !!distribution.issuer &&
+    walletAddress === distribution.issuer;
+  const canReclaim = isAdmin && isIssuer && deadlinePassed && unclaimed > 0n;
+
+  async function onReclaim() {
+    const ok = await tx.run(() =>
+      dividend.reclaimUnclaimed(network, distribution.id),
+    );
+    if (ok) onChanged();
+  }
+
+  return (
+    <li className="rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-sm text-base-100/80">
+          <span className="font-mono text-xs text-base-100/50">{truncateAddress(distribution.id)}</span>
+          {" · "}
+          {formatTokenAmount(distribution.claimedAmount, 7)} / {formatTokenAmount(distribution.totalAmount, 7)} claimed
+        </div>
+        <span className="text-xs text-base-100/50">
+          {deadlinePassed ? "Deadline passed" : "Open"}
+        </span>
+      </div>
+      {canReclaim && (
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onReclaim}
+            disabled={tx.status === "pending"}
+            className="rounded-lg border border-white/10 bg-white/5 px-3 py-1 text-xs text-base-100/80 hover:border-brand-400 hover:text-base-100 disabled:opacity-50"
+          >
+            {tx.status === "pending" ? "Reclaiming…" : "Reclaim unclaimed funds"}
+          </button>
+          <TxProgress status={tx.status} error={tx.error} hash={tx.hash} />
+        </div>
+      )}
+    </li>
   );
 }
