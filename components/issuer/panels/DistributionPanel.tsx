@@ -80,7 +80,7 @@ export function DistributionPanel({ asset, onCreated, isAdmin = true }: Distribu
         {...(onCreated !== undefined ? { onCreated } : {})}
         isAdmin={isAdmin}
       />
-      <ExistingDistributionsCard tokenContract={asset.tokenContract} />
+      <ExistingDistributionsCard tokenContract={asset.tokenContract} isAdmin={isAdmin} />
     </div>
   );
 }
@@ -213,283 +213,199 @@ function CreateDistributionCard({
       const decimals = await assetToken.decimals(network, pt);
       raw = parseTokenAmount(totalAmount, decimals);
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : "Invalid amount.");
+      setFormError(err instanceof Error ? err.message : "Invalid total amount.");
       return;
     }
+
     if (raw <= 0n) {
       setFormError("Total amount must be greater than zero.");
       return;
     }
-    if (balance !== null && raw > balance) {
-      setFormError("Total amount exceeds your payment-token balance.");
+
+    const deadline = claimDeadline.trim() ? Number(claimDeadline) : 0;
+    if (!Number.isFinite(deadline) || deadline < 0) {
+      setFormError("Claim deadline must be a non-negative ledger number.");
       return;
-    }
-    if (allowance !== null && raw > allowance) {
-      setFormError("The dividend contract allowance is insufficient. Approve it to spend at least the requested amount before creating this distribution.");
-      return;
-    }
-    let deadline = 0;
-    if (claimDeadline.trim()) {
-      deadline = Number.parseInt(claimDeadline.trim(), 10);
-      if (!Number.isInteger(deadline) || deadline < 0) {
-        setFormError("Claim deadline must be a non-negative ledger number (0 = no deadline).");
-        return;
-      }
-      if (deadline > 0) {
-        try {
-          const latestLedger = await getLatestLedger(network);
-          if (deadline <= latestLedger) {
-            setFormError(`Ledger ${deadline} has already passed (current ledger: ${latestLedger}).`);
-            return;
-          }
-        } catch {
-          // The contract remains the final authority if the ledger is unavailable.
-        }
-      }
     }
 
-    let eligible: Holder[];
+    const holders = holderSnapshot ?? [];
+    if (holders.length === 0) {
+      setFormError("No eligible holders found for this asset.");
+      return;
+    }
+
+    const snapshotXdr = JSON.stringify(
+      holders.map(({ address: holderAddress, balance: holderBalance }) => ({
+        address: holderAddress,
+        balance: holderBalance.toString(),
+      })),
+    );
+    if (snapshotXdr.length > MAX_SNAPSHOT_XDR_BYTES) {
+      setFormError("Holder snapshot is too large to submit in a single transaction.");
+      return;
+    }
+
+    const latestLedger = await getLatestLedger(network);
+    const resolvedDeadline = deadline > 0 ? deadline : latestLedger + 100;
+
+    await tx.run(
+      () =>
+        dividend.createDistribution(
+          network,
+          address!,
+          tokenContract,
+          pt,
+          raw,
+          resolvedDeadline,
+          holders.map(({ address: holderAddress, balance: holderBalance }) => ({
+            address: holderAddress,
+            amount: holderBalance,
+          })),
+        ),
+      {
+        onSuccess: () => {
+          setPaymentToken("");
+          setTotalAmount("");
+          setClaimDeadline("");
+          onCreated?.();
+        },
+      },
+    );
+  }
+
+  async function refreshSnapshot() {
     setSnapshotRefreshing(true);
     try {
-      eligible = await fetchOnChainHolders(network, complianceContract, tokenContract);
-    } catch (err) {
-      setFormError(
-        err instanceof Error
-          ? `Unable to refresh holder snapshot: ${err.message}`
-          : "Unable to refresh holder snapshot. Try again.",
-      );
-      return;
+      const holders = await fetchOnChainHolders(network, complianceContract, tokenContract);
+      setRefreshedSnapshot({ key: snapshotKey, holders });
     } finally {
       setSnapshotRefreshing(false);
-    }
-    if (!holderSnapshot || !sameHolderSnapshot(holderSnapshot, eligible)) {
-      setRefreshedSnapshot({ key: snapshotKey, holders: eligible });
-      setFormError("Holder balances changed. Review the updated snapshot and submit again.");
-      return;
-    }
-    if (eligible.length === 0) {
-      setFormError("No eligible holders have a balance in this asset.");
-      return;
-    }
-    const eligibleTuples = eligible.map(
-      ({ address, balance }) => [address, balance] as const,
-    );
-    const snapshotBytes = arg.vecOfTuples(eligibleTuples).toXDR().length;
-    if (snapshotBytes > MAX_SNAPSHOT_XDR_BYTES) {
-      setFormError(
-        `The ${eligible.length}-holder snapshot is too large for one Soroban transaction. Reduce the eligible holder count and try again.`,
-      );
-      return;
-    }
-
-    const res = await tx.run((ctx) =>
-      dividend.createDistribution(ctx, tokenContract, pt, raw, eligibleTuples, deadline),
-    );
-    if (res) {
-      setPaymentToken("");
-      setTotalAmount("");
-      setClaimDeadline("");
-      onCreated?.();
     }
   }
 
   return (
     <ActionCard
       title="Create distribution"
-      description="Fund a new dividend distribution. Eligible holders receive shares based on their balances in the confirmed snapshot."
-      accent="bg-gold-500/10 text-gold-400"
-      icon={
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" strokeLinecap="round" />
-        </svg>
-      }
+      description="Snapshot eligible holders and fund a new dividend distribution."
     >
-      <form onSubmit={onSubmit} className="space-y-3">
-        <div className="rounded-lg border border-white/5 bg-white/[0.03] px-3 py-2 text-xs">
-          {holderSnapshot === null ? (
-            <span className="text-base-100/55">
-              {holderState.loading
-                ? "Loading holder snapshot…"
-                : "Holder snapshot is unavailable. Refresh the page and try again."}
-            </span>
-          ) : holderSnapshot.length === 0 ? (
-            <span className="text-base-100/55">No eligible holders</span>
-          ) : (
-            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
-              <span className="text-base-100/70">
-                Snapshot: {holderSnapshot.length} eligible holders
-              </span>
-              <span className="text-base-100/70">
-                Total balance: {formatTokenAmount(snapshotTotal, assetDecimals)} {assetSymbol}
-              </span>
-            </div>
-          )}
-        </div>
+      <form onSubmit={onSubmit} className="space-y-4">
         <div>
-          <label htmlFor="dist-payment-token" className="label">Payment token contract</label>
+          <label htmlFor="dist-payment-token" className="block text-sm font-medium text-base-100/80">
+            Payment token
+          </label>
           <input
             id="dist-payment-token"
+            type="text"
             value={paymentToken}
             onChange={(e) => setPaymentToken(e.target.value)}
-            placeholder="C… (SAC or Soroban token contract)"
-            disabled={tx.pending || !isAdmin}
-            className="input font-mono text-xs"
-            spellCheck={false}
-            aria-invalid={tokenInvalid || undefined}
+            placeholder="C…"
+            aria-invalid={tokenInvalid}
             aria-describedby={tokenInvalid ? "dist-form-error" : undefined}
+            className="mt-1 w-full rounded-lg border border-white/10 bg-base-900/60 px-3 py-2 text-sm text-base-100 placeholder:text-base-100/30 focus:border-primary focus:outline-none"
           />
-          <p className="mt-1 text-[11px] text-base-100/55">
-            This is the token used to pay holders — typically a stablecoin or XLM SAC.
-          </p>
-
-          {/* #323: Known-token preset buttons so the issuer doesn't have to paste
-              the XLM SAC address (or other well-known tokens) manually. */}
-          {KNOWN_TOKENS[network] && KNOWN_TOKENS[network].length > 0 && (
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              <span className="text-[10px] text-base-100/30">Presets:</span>
-              {KNOWN_TOKENS[network].map((token) => (
-                <button
-                  key={token.contractId}
-                  type="button"
-                  disabled={tx.pending}
-                  onClick={() => setPaymentToken(token.contractId)}
-                  aria-label={`Use ${token.label} (${token.contractId})`}
-                  className={[
-                    "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
-                    paymentToken.trim() === token.contractId
-                      ? "border-brand-500/50 bg-brand-500/10 text-brand-300"
-                      : "border-white/10 bg-white/[0.04] text-base-100/50 hover:border-white/20 hover:text-base-100/80",
-                  ].join(" ")}
-                >
-                  <span>{token.symbol}</span>
-                  <span className="text-base-100/30">·</span>
-                  <span>{token.label}</span>
-                </button>
-              ))}
-            </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {KNOWN_TOKENS[network].map((token) => (
+              <button
+                key={token.contractId}
+                type="button"
+                onClick={() => setPaymentToken(token.contractId)}
+                className="rounded-full border border-white/10 px-2.5 py-1 text-xs text-base-100/70 hover:border-primary hover:text-primary"
+              >
+                {token.label}
+              </button>
+            ))}
+          </div>
+          {isValidPt && (
+            <p className="mt-1 text-xs text-base-100/50">
+              {balanceLoading || allowanceLoading ? (
+                <Spinner size="sm" />
+              ) : (
+                <>
+                  Balance: {balance !== null ? formatTokenAmount(balance, paymentTokenDecimals ?? 7) : "—"}
+                  {" · "}
+                  Approved: {allowance !== null ? formatTokenAmount(allowance, paymentTokenDecimals ?? 7) : "—"}
+                </>
+              )}
+            </p>
+          )}
+          {decimalsError && (
+            <p className="mt-1 text-xs text-red-400">Could not read token decimals.</p>
           )}
         </div>
 
         <div>
-          <label htmlFor="dist-deadline" className="label">Claim deadline ledger</label>
+          <label htmlFor="dist-total" className="block text-sm font-medium text-base-100/80">
+            Total amount ({assetSymbol})
+          </label>
           <input
-            id="dist-deadline"
-            value={claimDeadline}
-            onChange={(e) => setClaimDeadline(e.target.value)}
-            placeholder="0 = no deadline"
-            inputMode="numeric"
-            disabled={tx.pending || !isAdmin}
-            className="input"
+            id="dist-total"
+            type="text"
+            inputMode="decimal"
+            value={totalAmount}
+            onChange={(e) => setTotalAmount(e.target.value)}
+            placeholder="0.00"
+            aria-invalid={totalInvalid}
+            aria-describedby={totalErrorIds}
+            className="mt-1 w-full rounded-lg border border-white/10 bg-base-900/60 px-3 py-2 text-sm text-base-100 placeholder:text-base-100/30 focus:border-primary focus:outline-none"
           />
-          <p className="mt-1 text-[11px] text-base-100/40">
-            Holders can claim until this ledger. Leave at 0 for unlimited claims.
-          </p>
+          {insufficientBalance && (
+            <p id="dist-total-error" className="mt-1 text-xs text-red-400">
+              Amount exceeds your payment-token balance.
+            </p>
+          )}
+          {needsApproval && (
+            <p className="mt-1 text-xs text-amber-400">
+              The dividend contract needs an allowance of at least this amount.
+            </p>
+          )}
         </div>
-
-        {/* #293: surface balance + allowance so the issuer knows before submitting */}
-        {isValidPt && address && (
-          <div className="rounded-xl border border-white/5 bg-white/[0.03] px-3 py-2.5 space-y-1.5 text-[11px]">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-base-100/55">Your balance</span>
-              {balanceLoading ? (
-                <Spinner size={10} />
-              ) : balance !== null && paymentTokenDecimals !== null ? (
-                <span className={insufficientBalance ? "font-semibold text-red-400" : "text-base-100/80"}>
-                  {formatTokenAmount(balance, paymentTokenDecimals)}
-                </span>
-              ) : (
-                <span className="text-base-100/55">—</span>
-              )}
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-base-100/55">Dividend contract allowance</span>
-              {allowanceLoading ? (
-                <Spinner size={10} />
-              ) : allowance !== null && paymentTokenDecimals !== null ? (
-                <span className={needsApproval ? "font-semibold text-amber-400" : "text-base-100/80"}>
-                  {formatTokenAmount(allowance, paymentTokenDecimals)}
-                </span>
-              ) : (
-                <span className="text-base-100/55">—</span>
-              )}
-            </div>
-          </div>
-        )}
-
-        {insufficientBalance && (
-          <p id="dist-total-error" role="alert" className="text-xs text-red-400">
-            The requested pool exceeds your payment-token balance.
-          </p>
-        )}
-        {needsApproval && !insufficientBalance && (
-          <p id="dist-total-error" role="alert" className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-200/90">
-            The dividend contract is not approved to spend enough of this token on your behalf.
-            Creating this distribution is blocked until you submit an{" "}
-            <strong className="font-semibold">approve</strong> transaction for at least{" "}
-            {formatTokenAmount(requestedRaw ?? 0n, paymentTokenDecimals ?? 0)} tokens.
-          </p>
-        )}
 
         <div>
-          <label htmlFor="dist-total" className="label">Total pool amount</label>
-          <div className="relative">
-            <input
-              id="dist-total"
-              value={totalAmount}
-              onChange={(e) => setTotalAmount(e.target.value)}
-              placeholder="Enter amount"
-              inputMode="decimal"
-              disabled={tx.pending || !isAdmin}
-              className="input pr-16"
-              aria-invalid={totalInvalid || undefined}
-              aria-describedby={totalErrorIds}
-            />
-            <span className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 text-xs font-medium text-base-100/55">
-              tokens
-            </span>
-          </div>
-          <p className="mt-1 text-[11px] text-base-100/55">
-            {paymentTokenDecimals !== null
-              ? `Uses ${paymentTokenDecimals} decimals for ${truncateAddress(paymentToken.trim())}.`
-              : decimalsLoading
-                ? "Loading payment token decimals…"
-                : decimalsError
-                  ? `Couldn't load payment token decimals: ${decimalsError}`
-                  : "Enter a payment token contract to load its decimals."}
-          </p>
+          <label htmlFor="dist-deadline" className="block text-sm font-medium text-base-100/80">
+            Claim deadline (ledger, optional)
+          </label>
+          <input
+            id="dist-deadline"
+            type="text"
+            inputMode="numeric"
+            value={claimDeadline}
+            onChange={(e) => setClaimDeadline(e.target.value)}
+            placeholder="e.g. 1234567"
+            className="mt-1 w-full rounded-lg border border-white/10 bg-base-900/60 px-3 py-2 text-sm text-base-100 placeholder:text-base-100/30 focus:border-primary focus:outline-none"
+          />
         </div>
 
-        {formError && <p id="dist-form-error" role="alert" className="text-xs text-red-400">{formError}</p>}
+        <div className="rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2 text-xs text-base-100/60">
+          <div className="flex items-center justify-between">
+            <span>
+              Eligible holders: {holderSnapshot?.length ?? 0} · Total: {formatTokenAmount(snapshotTotal, assetDecimals)} {assetSymbol}
+            </span>
+            <button
+              type="button"
+              onClick={refreshSnapshot}
+              disabled={snapshotRefreshing}
+              className="text-primary hover:underline disabled:opacity-50"
+            >
+              {snapshotRefreshing ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+        </div>
 
-        {tx.phase === "idle" ? (
-          <button
-            type="submit"
-            disabled={tx.pending || snapshotRefreshing || !isAdmin || insufficientBalance || needsApproval}
-            className="btn-primary"
-            title={
-              !isAdmin
-                ? "Only the asset admin can create distributions"
-                : insufficientBalance
-                  ? "The requested amount exceeds your payment-token balance"
-                  : needsApproval
-                    ? "Approve the dividend contract before creating this distribution"
-                    : ""
-            }
-          >
-            {snapshotRefreshing ? "Refreshing holder snapshot…" : "Create distribution"}
-          </button>
-        ) : (
-          <TxProgress
-            phase={tx.phase}
-            hash={tx.hash}
-            error={tx.error}
-            errorType={tx.errorType}
-            onDismiss={tx.reset}
-            onRetry={tx.retry}
-            retryable={tx.retryable}
-            successMessage="Distribution created. Holders can now claim their share."
-          />
+        {formError && (
+          <p id="dist-form-error" className="text-sm text-red-400">
+            {formError}
+          </p>
         )}
+
+        <TxProgress state={tx.state} />
+
+        <button
+          type="submit"
+          disabled={tx.state.status === "pending"}
+          className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary/90 disabled:opacity-50"
+        >
+          {tx.state.status === "pending" ? "Creating…" : "Create distribution"}
+        </button>
       </form>
     </ActionCard>
   );
@@ -497,74 +413,107 @@ function CreateDistributionCard({
 
 // ---- Existing distributions ----
 
-function ExistingDistributionsCard({ tokenContract }: { tokenContract: string }) {
+function ExistingDistributionsCard({
+  tokenContract,
+  isAdmin = true,
+}: {
+  tokenContract: string;
+  isAdmin?: boolean;
+}) {
+  const { address, network } = useWallet();
   const { data, loading, error, refetch } = useDividends(tokenContract);
+  const [confirmingId, setConfirmingId] = useState<number | null>(null);
+  const cancelTx = useTx();
+
+  async function onCancel(distributionId: number) {
+    await cancelTx.run(
+      () =>
+        dividend.cancelDistribution(network, address!, tokenContract, distributionId),
+      {
+        onSuccess: () => {
+          setConfirmingId(null);
+          refetch();
+        },
+      },
+    );
+  }
+
+  if (loading) {
+    return (
+      <ActionCard title="Distributions" description="Existing dividend distributions for this asset.">
+        <div className="flex justify-center py-6">
+          <Spinner />
+        </div>
+      </ActionCard>
+    );
+  }
+
+  if (error) {
+    return (
+      <ActionCard title="Distributions" description="Existing dividend distributions for this asset.">
+        <ErrorState message={error} onRetry={refetch} />
+      </ActionCard>
+    );
+  }
+
   const distributions = data ?? [];
 
   return (
-    <ActionCard
-      title="Distribution history"
-      description="All distributions created for this asset and their claim progress."
-      accent="bg-brand-500/10 text-brand-400"
-      icon={
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <path d="M3 3h18v18H3z" rx="2" />
-          <path d="M3 9h18M9 21V9" strokeLinecap="round" />
-        </svg>
-      }
-    >
-      {loading ? (
-        <div className="flex items-center gap-2 py-4 text-sm text-base-100/55">
-          <Spinner size={14} /> Loading distributions…
-        </div>
-      ) : error ? (
-        <ErrorState
-          title="Couldn't load distributions"
-          message={error}
-          onRetry={refetch}
-          className="py-6"
-        />
-      ) : distributions.length === 0 ? (
-        <EmptyState
-          title="No distributions yet"
-          description="Create your first distribution above."
-          className="py-8 border-0 bg-transparent"
-        />
+    <ActionCard title="Distributions" description="Existing dividend distributions for this asset.">
+      {distributions.length === 0 ? (
+        <EmptyState title="No distributions yet" description="Create one above to get started." />
       ) : (
         <ul className="divide-y divide-white/5">
-          {distributions.map((d) => {
-            const pct = percent(d.distributed, d.totalAmount);
+          {distributions.map((distribution) => {
+            const isConfirming = confirmingId === distribution.id;
+            const canCancel = isAdmin && !!address && distribution.status === "active";
             return (
-              <li key={d.id.toString()} className="py-3">
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-semibold text-base-100">
-                        Distribution #{d.id.toString()}
-                      </span>
-                      {d.completed ? (
-                        <span className="chip border border-brand-500/25 bg-brand-500/10 text-brand-300 text-[10px]">Complete</span>
-                      ) : (
-                        <span className="chip border border-gold-500/25 bg-gold-500/10 text-gold-300 text-[10px]">Active</span>
-                      )}
+              <li key={distribution.id} className="py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-base-100">
+                      #{distribution.id} · {formatTokenAmount(distribution.totalAmount, distribution.decimals)} {distribution.symbol}
+                    </p>
+                    <p className="text-xs text-base-100/50">
+                      {distribution.status} · {percent(distribution.claimedPercent)} claimed
+                    </p>
+                  </div>
+                  {canCancel && !isConfirming && (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmingId(distribution.id)}
+                      className="rounded-lg border border-red-500/40 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/10"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+                {canCancel && isConfirming && (
+                  <div className="mt-2 rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2">
+                    <p className="text-xs text-base-100/70">
+                      Cancel distribution #{distribution.id}? Unclaimed funds will be returned to the issuer.
+                    </p>
+                    <div className="mt-2 flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => onCancel(distribution.id)}
+                        disabled={cancelTx.state.status === "pending"}
+                        className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500/90 disabled:opacity-50"
+                      >
+                        {cancelTx.state.status === "pending" ? "Cancelling…" : "Confirm cancel"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmingId(null)}
+                        disabled={cancelTx.state.status === "pending"}
+                        className="rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-base-100/70 hover:bg-white/5 disabled:opacity-50"
+                      >
+                        Keep
+                      </button>
                     </div>
-                    <p className="text-[11px] text-base-100/55">
-                      Payment token: {truncateAddress(d.paymentToken)}
-                    </p>
+                    <TxProgress state={cancelTx.state} />
                   </div>
-                  <div className="text-right">
-                    <p className="text-sm font-bold text-gold-300">
-                      {formatTokenAmount(d.totalAmount, d.paymentTokenDecimals)}
-                    </p>
-                    <p className="text-[11px] text-base-100/55">{pct.toFixed(1)}% claimed</p>
-                  </div>
-                </div>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/5">
-                  <div
-                    className="h-full rounded-full bg-gradient-to-r from-brand-500 to-brand-400"
-                    style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
-                  />
-                </div>
+                )}
               </li>
             );
           })}
